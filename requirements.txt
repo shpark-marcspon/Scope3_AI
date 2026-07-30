@@ -1,0 +1,18 @@
+# Scope3 AI 자동 산정 파이프라인 — 필요 패키지
+# 설치: pip install -r requirements.txt
+#
+# scope3_pipeline_claude.py (Claude Sonnet 5 버전) 기준입니다.
+# scope3_pipeline.py (OpenAI 버전)를 쓰신다면 맨 아래 anthropic 줄을 openai로 바꿔주세요.
+
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
+geopy>=2.4
+rapidfuzz>=3.5
+
+# .env 파일로 API 키 등 환경변수를 관리하려면 사용 (선택)
+python-dotenv>=1.0
+
+# LLM 호출용
+anthropic>=0.40
+openai>=1.30          # ← scope3_pipeline.py(OpenAI 버전)를 쓸 경우 위 anthropic 대신 이 줄 사용
