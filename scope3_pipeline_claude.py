@@ -118,7 +118,7 @@ def infer_scope3_category_llm(row, sheet_name):
         messages=[{"role": "user", "content": prompt}],
     )
 
-    result = res.content[0].text.strip()
+    result = _extract_response_text(res).strip()
 
     valid = set(allowed + ["Unknown"])
     if result not in valid:
@@ -138,29 +138,85 @@ client = Anthropic()  # ANTHROPIC_API_KEY 환경변수를 자동으로 읽습니
 
 geolocator = Nominatim(user_agent="scope3_ai", timeout=10)
 
-# ── 공용 AI 호출 헬퍼 (rule 테이블에 없는 값에 대한 AI 판단 폴백들이 공유) ──
-def _call_claude_text(prompt, system=None, max_tokens=150):
-    try:
-        res = client.messages.create(
-            model="claude-sonnet-5", max_tokens=max_tokens,
-            system=system, messages=[{"role": "user", "content": prompt}],
-        )
-        return res.content[0].text.strip()
-    except Exception:
-        return None
 
-def _call_claude_json(prompt, max_tokens=150):
-    text = _call_claude_text(
-        prompt,
-        system="Return only valid JSON, with no other text before or after it.",
-        max_tokens=max_tokens,
-    )
+def _extract_response_text(res):
+    """
+    Claude 응답에서 첫 번째 텍스트 블록을 추출한다.
+    (extended thinking이 켜져 있으면 res.content[0]이 텍스트가 아니라
+    ThinkingBlock(.text가 아닌 .thinking 속성만 가짐)일 수 있어,
+    content[0]을 무조건 텍스트라고 가정하면 안 된다.)
+    """
+    for block in res.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    return ""
+
+# ── 공용 AI 호출 헬퍼 (rule 테이블에 없는 값에 대한 AI 판단 폴백들이 공유) ──
+# PATCH: 단위환산 등 "규칙에 없으면 무조건 AI가 판단" 해야 하는 지점에서
+# 네트워크/일시적 오류로 AI 호출이 한 번 실패했다고 바로 포기하고
+# "[미지원 단위: ...]" 같은 실패 메시지를 반환하는 문제를 막기 위해,
+# 재시도(retry) + JSON 파싱 실패 시 숫자만 정규식으로 추출하는 fallback을 추가한다.
+import re
+import time
+
+
+def _call_claude_text(prompt, system=None, max_tokens=150, retries=3, retry_delay=1.0):
+    """Claude 호출. 일시적 오류(레이트리밋/네트워크 등)에 대비해 최대 retries회 재시도한다."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            res = client.messages.create(
+                model="claude-sonnet-5", max_tokens=max_tokens,
+                system=system, messages=[{"role": "user", "content": prompt}],
+            )
+            text = _extract_response_text(res).strip()
+            if text:
+                return text
+        except Exception as e:
+            last_err = e
+        if attempt < retries - 1:
+            time.sleep(retry_delay * (attempt + 1))  # 점진적 백오프
+    if last_err is not None:
+        print(f"  [AI 호출 경고] {retries}회 재시도 후에도 실패: {last_err}")
+    return None
+
+
+def _extract_json_object(text):
+    """모델이 JSON 앞뒤에 다른 텍스트를 덧붙였을 때를 대비해 {...} 블록만 추출."""
     if not text:
         return None
     try:
         return safe_json_loads(text)
     except Exception:
-        return None
+        pass
+    m = re.search(r"\{.*?\}", text, re.DOTALL)
+    if m:
+        try:
+            return safe_json_loads(m.group())
+        except Exception:
+            return None
+    return None
+
+
+def _call_claude_json(prompt, max_tokens=150, retries=3):
+    """
+    JSON 응답을 요구하는 AI 호출.
+    1) 정상 JSON 파싱 시도
+    2) 실패 시 응답 안에서 {...} 블록만 골라 재파싱
+    3) 그래도 실패하면 재시도(다음 attempt에서 프롬프트에 형식 재강조)
+    """
+    for attempt in range(retries):
+        sys_prompt = "Return only valid JSON, with no other text before or after it."
+        p = prompt if attempt == 0 else (
+            prompt + "\n\n반드시 JSON 객체 하나만 출력하라. 다른 설명/문장은 절대 포함하지 마라."
+        )
+        text = _call_claude_text(p, system=sys_prompt, max_tokens=max_tokens, retries=1)
+        parsed = _extract_json_object(text)
+        if parsed is not None:
+            return parsed
+        if attempt < retries - 1:
+            time.sleep(0.5)
+    return None
 
 # ── [원본 셀 12] ─────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
@@ -214,29 +270,29 @@ def _load_ef_sheet(sheet_name, header_row=1, str_cols=None):
 
 # ── 에너지 DB (C3, C8, C13) ──────────────────────────────────
 energy_ef_db = _load_ef_sheet("에너지", header_row=3)  # PATCH: 실제 헤더 행(0-index=3)
-print(f"✅ energy_ef_db: {len(energy_ef_db)}행  컬럼: {energy_ef_db.columns.tolist()}")
+print(f"[OK] energy_ef_db: {len(energy_ef_db)}행  컬럼: {energy_ef_db.columns.tolist()}")
 
 # ── 운송 DB (C4, C9) ─────────────────────────────────────────
 transport_ef_db = _load_ef_sheet("운송", header_row=1)
-print(f"✅ transport_ef_db: {len(transport_ef_db)}행")
+print(f"[OK] transport_ef_db: {len(transport_ef_db)}행")
 
 # ── 출장·통근 DB (C6, C7) ────────────────────────────────────
 travel_ef_db = _load_ef_sheet("출장_통근", header_row=1)
-print(f"✅ travel_ef_db: {len(travel_ef_db)}행")
+print(f"[OK] travel_ef_db: {len(travel_ef_db)}행")
 
 # ── 폐기물_C5 DB ─────────────────────────────────────────────
 waste_c5_db = _load_ef_sheet("폐기물_C5", header_row=2)
-print(f"✅ waste_c5_db: {len(waste_c5_db)}행")
+print(f"[OK] waste_c5_db: {len(waste_c5_db)}행")
 
 # ── 폐기물_C12 DB ─────────────────────────────────────────────
 waste_c12_db = _load_ef_sheet("폐기물_C12", header_row=1,
                                str_cols=["대분류\n코드","중분류\n코드","소분류\n코드"])
-print(f"✅ waste_c12_db: {len(waste_c12_db)}행")
+print(f"[OK] waste_c12_db: {len(waste_c12_db)}행")
 # ── 운송·출장 지출기반 배출계수 DB 로드 ──────────────────────
 transport_spend_db = _load_ef_sheet("운송_Spend", header_row=2)
 travel_spend_db    = _load_ef_sheet("출장_Spend",  header_row=2)
-print(f"✅ transport_spend_db: {len(transport_spend_db)}행")
-print(f"✅ travel_spend_db:    {len(travel_spend_db)}행")
+print(f"[OK] transport_spend_db: {len(transport_spend_db)}행")
+print(f"[OK] travel_spend_db:    {len(travel_spend_db)}행")
 
 
 # ── 환경부 전체 평균 EF (처리방법 미입력/매핑 없음 시) ──────
@@ -259,7 +315,7 @@ def _build_transport_ef_map_from_db():
     return result
 
 TRANSPORT_EF_MAP = _build_transport_ef_map_from_db()
-print(f"✅ TRANSPORT_EF_MAP: {TRANSPORT_EF_MAP}")
+print(f"[OK] TRANSPORT_EF_MAP: {TRANSPORT_EF_MAP}")
 
 # ── 출장·통근 EF 맵 (코드 → kgCO2eq/km·인) ──────────────────
 def _build_travel_ef_map_from_db():
@@ -300,7 +356,7 @@ def _build_travel_ef_map_from_db():
 TRAVEL_EF_MAP = _build_travel_ef_map_from_db()
 BUSINESS_TRAVEL_EF = TRAVEL_EF_MAP   # 기존 변수명 호환
 COMMUTE_EF = TRAVEL_EF_MAP
-print(f"✅ TRAVEL_EF_MAP 로드 완료")
+print(f"[OK] TRAVEL_EF_MAP 로드 완료")
 
 # ── 에너지 EF 검색 함수 ───────────────────────────────────────
 def lookup_energy_ef(energy_name: str, unit_hint: str = None):
@@ -401,7 +457,7 @@ if _kw_col:
     spend_db["한국어매핑키워드"] = _usepa_raw[_kw_col]
 
 spend_db = spend_db.dropna(subset=["name"]).drop_duplicates(subset=["name"]).reset_index(drop=True)
-print(f"✅ spend_db (배출계수_통합_DB.xlsx > 구매_USEPA): {len(spend_db)}행, EF 컬럼: {_krw_col or _usd_col}, "
+print(f"[OK] spend_db (배출계수_통합_DB.xlsx > 구매_USEPA): {len(spend_db)}행, EF 컬럼: {_krw_col or _usd_col}, "
       f"유효 EF 값: {spend_db['ef'].notna().sum()}/{len(spend_db)}")
 spend_db.head()
 
@@ -446,6 +502,11 @@ _TREATMENT_ALIAS = {
     "매립": "매립", "land": "매립", "landfill": "매립",
     "소각": "소각", "incineration": "소각", "incinerator": "소각", "inc": "소각",
     "재활용": "재활용", "recycling": "재활용", "recycle": "재활용", "rec": "재활용",
+    # PATCH: "기타"가 별칭에 없으면 _normalize_treatment()가 None을 반환하고,
+    # lookup_waste_ef()의 처리방법 필터가 빈 문자열과 비교돼 DB에 폐기물종류별로
+    # 정확히 정의된 "기타" 행(예: 폐콘크리트류+기타→매립평균)을 아예 찾지 못한 채
+    # 무조건 WASTE_AVG_EF["소각"]로 떨어지는 문제가 있었다.
+    "기타": "기타", "other": "기타", "etc": "기타",
 }
 
 def _normalize_waste_name(raw: str) -> str:
@@ -850,6 +911,7 @@ def calc_travel_spend_emission(row) -> dict:
     }
 
 # ── [원본 셀 20] ─────────────────────────────────────────────
+@lru_cache(maxsize=1024)
 def normalize_city(city):
 
     prompt = f"""
@@ -870,48 +932,19 @@ def normalize_city(city):
         messages=[{"role": "user", "content": prompt}],
     )
 
-    return res.content[0].text.strip()
+    return _extract_response_text(res).strip()
 
 # ── [원본 셀 22] ─────────────────────────────────────────────
-def estimate_distance_ai(origin, dest, country_hint="KR", mode="road"):
+@lru_cache(maxsize=1024)
+def _cached_geocode(query: str):
     """
-    거리 fallback 추정용
-    - road일 때만 사용 권장
-    - sea / air / rail은 별도 처리 권장
+    geolocator.geocode() 결과 캐시.
+    같은 지명(예: '서울, KR')이 데이터에 여러 번 나올 때마다 Nominatim에
+    매번 새로 조회하면 행 수가 많을수록 매우 느려지고, 요청 간 딜레이가 없어
+    레이트리밋에 걸릴 위험도 커진다. 지명→좌표는 실행 중 바뀌지 않으므로 캐시로 재사용한다.
     """
-    try:
-        if not origin or not dest:
-            return None
+    return geolocator.geocode(query)
 
-        origin = normalize_city(origin)
-        dest = normalize_city(dest)
-
-        # 국가 힌트 추가
-        q_origin = f"{origin}, {country_hint}" if country_hint else origin
-        q_dest = f"{dest}, {country_hint}" if country_hint else dest
-
-        o = geolocator.geocode(q_origin)
-        d = geolocator.geocode(q_dest)
-
-        if o and d:
-            o_coords = (o.latitude, o.longitude)
-            d_coords = (d.latitude, d.longitude)
-
-            km = geodesic(o_coords, d_coords).km
-
-            # 운송수단별 보정
-            if mode == "road":
-                return km * 1.3   # 직선거리 -> 대략 도로거리 보정
-            elif mode == "parcel":
-                return km * 1.35
-            else:
-                # sea / air / rail 은 여기서 계산하지 않고 None 처리하는 것도 가능
-                return km
-
-    except Exception:
-        pass
-
-    return None
 
 # ── [원본 셀 24] ─────────────────────────────────────────────
 
@@ -1053,8 +1086,8 @@ def estimate_straight_distance(origin, dest, country_hint=None):
         q_origin = f"{origin}, {country_hint}" if country_hint else origin
         q_dest = f"{dest}, {country_hint}" if country_hint else dest
 
-        o = geolocator.geocode(q_origin)
-        d = geolocator.geocode(q_dest)
+        o = _cached_geocode(q_origin)
+        d = _cached_geocode(q_dest)
 
         if o and d:
             return geodesic((o.latitude, o.longitude), (d.latitude, d.longitude)).km
@@ -1353,7 +1386,7 @@ car
             messages=[{"role": "user", "content": prompt}],
         )
 
-        out = res.content[0].text.strip().lower()
+        out = _extract_response_text(res).strip().lower()
 
         # 혹시 불필요한 문자 제거
         out = out.replace(".", "").replace(",", "").strip()
@@ -1380,7 +1413,7 @@ def refresh_transport_ef_map():
     """통합 DB에서 운송 EF 재로드"""
     global TRANSPORT_EF_MAP
     TRANSPORT_EF_MAP = _build_transport_ef_map_from_db()
-    print(f"✅ TRANSPORT_EF_MAP 갱신: {TRANSPORT_EF_MAP}")
+    print(f"[OK] TRANSPORT_EF_MAP 갱신: {TRANSPORT_EF_MAP}")
 
 def _kg_to_ton(weight_kg):
     w = to_float(weight_kg)
@@ -1406,44 +1439,59 @@ JSON으로만 답하라: {{"distance_km": <숫자>}}"""
     d = to_float(parsed.get("distance_km")) if parsed else None
     return validate_distance_km(d, mode=mode, country_hint=country_hint)
 
+@lru_cache(maxsize=512)
+def _ai_estimate_straight_km(origin: str, dest: str, country_hint: str = "KR"):
+    """
+    지오코딩(estimate_straight_distance)이 실패했을 때, AI에게 두 지점 간
+    "직선거리(대권거리)"를 추정하게 한다. get_distance_km에서 지오코딩 성공 시와
+    동일한 방식(직선거리 × 이동수단별 보정계수)으로 처리하기 위한 것으로,
+    이동수단은 여기서 고려하지 않는다 (보정계수는 get_distance_km에서 곱함).
+    """
+    prompt = f"""두 지점 간 직선거리(대권거리, great-circle distance)를 km로 추정하라.
+출발지: {origin}
+도착지: {dest}
+국가 힌트: {country_hint}
+
+JSON으로만 답하라: {{"distance_km": <숫자>}}"""
+    parsed = _call_claude_json(prompt, max_tokens=60)
+    return to_float(parsed.get("distance_km")) if parsed else None
+
+_DISTANCE_MODE_FACTOR = {"road": 1.3, "parcel": 1.35, "air": 1.05, "sea": 1.30, "rail": 1.20}
+
 # ---------------------------
 # 기존 코드 호환용 get_distance_km
 # 기존 process_template_inventory / 출장 / 통근 함수에서 그대로 호출 가능
 # ---------------------------
 def get_distance_km(origin, dest, mode="road", country_hint="KR"):
+    """
+    PATCH: 이전에는 지오코딩 성공 시엔 "직선거리 × 보정계수"를, 지오코딩 실패로
+    AI 폴백에 들어가면 "AI가 추정한 실이동거리를 보정계수 없이 그대로" 써서
+    행마다 서로 다른 기준(직선거리 기반 vs 실거리 기반)이 섞여 있었다.
+    지오코딩 성공 여부와 무관하게 "직선거리를 구한 뒤 동일한 보정계수를 곱하는"
+    한 가지 방식으로 통일한다 (지오코딩 우선, 실패 시에만 AI가 직선거리를 추정).
+    """
     origin = _safe_text2(origin)
     dest = _safe_text2(dest)
 
     if not origin or not dest:
         return None
 
-    # road / parcel
-    if mode in ["road", "parcel"]:
-        d = estimate_distance_ai(origin, dest, country_hint=country_hint, mode=mode)
-        validated = validate_distance_km(d, mode=mode, country_hint=country_hint)
-        if validated is not None:
-            return validated
-        return _ai_estimate_distance_km(origin, dest, mode=mode, country_hint=country_hint)
+    factor = _DISTANCE_MODE_FACTOR.get(mode, 1.0)
 
-    # sea / air / rail
     straight = estimate_straight_distance(
         origin, dest,
         country_hint=country_hint if country_hint == "KR" else None
     )
-    if straight is not None:
-        if mode == "air":
-            d = straight * 1.05
-        elif mode == "sea":
-            d = straight * 1.30
-        elif mode == "rail":
-            d = straight * 1.20
-        else:
-            d = straight
+    if straight is None:
+        straight = _ai_estimate_straight_km(origin, dest, country_hint=country_hint)
 
-        validated = validate_distance_km(d, mode=mode, country_hint=country_hint)
+    if straight is not None:
+        validated = validate_distance_km(straight * factor, mode=mode, country_hint=country_hint)
         if validated is not None:
             return validated
 
+    # 직선거리 기반 추정이 모두 실패한 극히 예외적인 경우에만,
+    # AI에게 실이동거리를 직접 추정하게 하는 최종 폴백을 사용한다.
     return _ai_estimate_distance_km(origin, dest, mode=mode, country_hint=country_hint)
 
 # ---------------------------
@@ -2210,7 +2258,7 @@ ERP_TO_NAICS_HINTS = _load_usepa_hints_from_db() or [
 ]
 
 if ERP_TO_NAICS_HINTS:
-    print(f"✅ ERP_TO_NAICS_HINTS 로드: {len(ERP_TO_NAICS_HINTS)}개 항목")
+    print(f"[OK] ERP_TO_NAICS_HINTS 로드: {len(ERP_TO_NAICS_HINTS)}개 항목")
     # spend_db에 실제 존재하는 title만 필터링
     if "SPEND_DB_NAME_SET" in dir() and SPEND_DB_NAME_SET:
         for hint in ERP_TO_NAICS_HINTS:
@@ -2497,7 +2545,7 @@ def translate_product_for_search_info(product):
         messages=[{"role": "user", "content": prompt}],
     )
 
-    parsed = safe_json_loads(res.content[0].text)
+    parsed = safe_json_loads(_extract_response_text(res))
     selected_titles = parsed.get("selected_titles", [])
     if not isinstance(selected_titles, list):
         selected_titles = []
@@ -3487,32 +3535,84 @@ _MJ_PER_TOE = 41_868.0     # 1 toe = 41,868 MJ (국내 기준)
 _MJ_PER_GCAL= 4_186.8      # 1 Gcal = 4,186.8 MJ
 
 def _detect_energy_name(raw: str) -> str:
-    """입력된 에너지원명 → ENERGY_BASE_UNIT 키로 변환"""
+    """
+    입력된 에너지원명 → ENERGY_BASE_UNIT 키로 변환.
+
+    PATCH: 기존에는 "별칭이 입력에 포함(a in q)" 또는 "입력이 별칭에 포함(q in a)"
+    둘 다를 곧바로 매칭으로 인정해서, 예를 들어 짧은 입력 "LPG"(q)가
+    "도시가스(LPG)"의 별칭 "도시가스(lpg)"(a) 안에 부분 문자열로 포함된다는 이유만으로
+    (q in a) "액화석유가스(LPG)"(kg 기준, 올바른 항목)보다 먼저 "도시가스(LPG)"
+    (Nm³ 기준, 실제로는 다른 종류의 가스)로 잘못 매칭되는 문제가 있었다.
+    이로 인해 불필요한 kg→Nm³ 환산이 시도되고, 그 환산은 밀도 정보 없이는
+    신뢰성 있게 산정하기 어려워 결과적으로 "환산 재시도 필요" 메시지가 남았다.
+
+    이를 막기 위해 아래 순서로 매칭한다 (부분일치보다 정확일치를 항상 우선):
+      1) 별칭과 정확히 일치 (대소문자/공백/괄호 무시)
+      2) 표준명(std_name) 자체와 정확히 일치
+      3) 그래도 없으면 "별칭이 입력 문자열 안에 포함된 경우(a in q)"만 부분일치로 인정
+         (반대 방향 q in a는 인정하지 않음 — 짧은 입력이 다른 항목의 긴 별칭 속
+          부분 문자열이 되어 오매칭되는 것을 방지하기 위함)
+    """
     q = str(raw).strip().lower().replace(" ", "").replace("(", "").replace(")", "")
+
+    # 1) 별칭 정확 일치
     for std_name, aliases in ENERGY_NAME_ALIAS.items():
         for a in aliases:
-            if a.replace(" ","") in q or q in a.replace(" ",""):
+            if a.replace(" ", "") == q:
                 return std_name
-    # 직접 매칭
+
+    # 2) 표준명 정확 일치
     for std_name in ENERGY_BASE_UNIT:
-        if std_name.lower().replace(" ","") == q:
+        if std_name.lower().replace(" ", "") == q:
             return std_name
+
+    # 3) 부분 일치 (별칭 ⊂ 입력, 한 방향만 허용)
+    for std_name, aliases in ENERGY_NAME_ALIAS.items():
+        for a in aliases:
+            a_norm = a.replace(" ", "")
+            if a_norm and a_norm in q:
+                return std_name
+
     return raw  # 알 수 없으면 원본 반환
 
 
 @lru_cache(maxsize=512)
 def _ai_unit_conversion_factor(unit_raw: str, base_unit: str, context: str = ""):
-    """rule 테이블에 없는 단위 → base_unit 환산 배수를 AI가 추정. 실패 시 None."""
+    """
+    rule 테이블에 없는 단위 → base_unit 환산 배수를 AI가 추정.
+    규칙에 없는 단위라도 "무조건" 기준단위로 환산해야 하므로, 절대 조용히 포기하지 않는다:
+      1) JSON 형식으로 배수를 요청 (최대 3회 재시도는 _call_claude_json 내부에서 처리)
+      2) 그래도 유효한 factor를 못 받으면, 숫자만 답하라는 훨씬 단순한 프롬프트로 다시 시도
+    두 단계 모두 실패하는 경우(예: API 완전 중단)에만 None을 반환한다.
+    """
     prompt = f"""단위 환산 배수를 추정하라.
 입력 단위: {unit_raw}
 목표(기준) 단위: {base_unit}
 {f"맥락: {context}" if context else ""}
 
 "1 {unit_raw}"가 "{base_unit}" 몇 개에 해당하는지 배수(factor)를 계산하라.
+화학/물리적으로 정확한 값을 모르면, 온실가스 배출량 산정에 통상적으로 쓰이는
+표준 환산값(예: 표준상태 기준 밀도, 발열량 등)을 근거로 최선의 추정값을 제시하라.
 JSON으로만 답하라: {{"factor": <숫자>}}"""
-    parsed = _call_claude_json(prompt, max_tokens=60)
+    parsed = _call_claude_json(prompt, max_tokens=80)
     factor = to_float(parsed.get("factor")) if parsed else None
-    return factor if (factor is not None and factor > 0) else None
+    if factor is not None and factor > 0:
+        return factor
+
+    # 1차 시도 실패 → 훨씬 단순한 프롬프트 + 자유 텍스트에서 숫자만 추출 (최후 재시도)
+    simple_prompt = (
+        f'"1 {unit_raw}"는 "{base_unit}" 단위로 몇인가? '
+        f'{f"(맥락: {context}) " if context else ""}'
+        f"설명 없이 숫자(배수)만 답하라."
+    )
+    text = _call_claude_text(simple_prompt, max_tokens=30, retries=2)
+    if text:
+        m = re.search(r"[-+]?\d[\d,]*\.?\d*(?:[eE][-+]?\d+)?", text.replace(",", ""))
+        if m:
+            f2 = to_float(m.group())
+            if f2 is not None and f2 > 0:
+                return f2
+    return None
 
 def convert_energy_unit(value: float, input_unit: str, energy_name: str) -> tuple:
     """
@@ -3567,7 +3667,9 @@ def convert_energy_unit(value: float, input_unit: str, energy_name: str) -> tupl
         ai_factor = _ai_unit_conversion_factor(input_unit, "kWh", context=energy_name)
         if ai_factor:
             return value * ai_factor, "kWh", f"{input_unit}→kWh (AI 판단: ×{ai_factor:.6g})"
-        return value, input_unit, f"[미지원 단위: {input_unit}→kWh]"
+        # 규칙에도 없고 AI 판단도 실패한 극히 예외적인 경우: 값은 유지하되
+        # "미지원"으로 단정하지 않고, 재확인이 필요하다는 중립적 안내만 남긴다.
+        return value, input_unit, f"{input_unit}→kWh (AI 환산 재시도 필요 - 값 미변환, 수동 확인 권장)"
 
     if base_norm in ("gj", "gj"):
         gj_factors = {
@@ -3584,7 +3686,7 @@ def convert_energy_unit(value: float, input_unit: str, energy_name: str) -> tupl
         ai_factor = _ai_unit_conversion_factor(input_unit, "GJ", context=energy_name)
         if ai_factor:
             return value * ai_factor, "GJ", f"{input_unit}→GJ (AI 판단: ×{ai_factor:.6g})"
-        return value, input_unit, f"[미지원 단위: {input_unit}→GJ]"
+        return value, input_unit, f"{input_unit}→GJ (AI 환산 재시도 필요 - 값 미변환, 수동 확인 권장)"
 
     # 연료 (기준: L 또는 Nm³ 또는 kg) — MJ 경유 환산
     if lhv_mj is None or lhv_mj <= 0:
@@ -3648,10 +3750,15 @@ def convert_energy_unit(value: float, input_unit: str, energy_name: str) -> tupl
         note = f"{input_unit}→{base_unit} (발열량 환산: ×{factor_display:.6g})"
         return converted, base_unit, note
 
+    # 규칙 테이블(중량/부피/에너지 환산표)이나 발열량(LHV) 경유 환산으로 처리되지 않는
+    # 단위 조합(예: kg → Nm³ 등 물성 정보가 필요한 경우)은 AI가 판단하여 환산한다.
+    # 규칙에 없다고 해서 "미지원"으로 처리하지 않고, 반드시 AI 판단을 거치도록 한다.
     ai_factor = _ai_unit_conversion_factor(input_unit, base_unit, context=energy_name)
     if ai_factor:
         return value * ai_factor, base_unit, f"{input_unit}→{base_unit} (AI 판단: ×{ai_factor:.6g})"
-    return value, input_unit, f"[미지원 단위: {input_unit}→{base_unit}]"
+    # 재시도까지 모두 실패한 극히 예외적인 경우에만 값을 그대로 두되,
+    # "미지원 단위"라는 확정적 표현 대신 재확인이 필요하다는 안내만 남긴다.
+    return value, input_unit, f"{input_unit}→{base_unit} (AI 환산 재시도 필요 - 값 미변환, 수동 확인 권장)"
 
 def normalize_unit(unit_raw: str) -> str:
     """단위 표기를 표준화 (소문자 + 공백 제거)"""
@@ -4270,7 +4377,7 @@ def _infer_group_name_llm(product_text: str) -> str:
             max_tokens=20,
             messages=[{"role": "user", "content": prompt}],
         )
-        return res.content[0].text.strip()
+        return _extract_response_text(res).strip()
     except Exception:
         return "Unknown"
 
@@ -5621,7 +5728,7 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
     for sheet_name in xls.sheet_names:
         match = _match_sheet_processor(sheet_name)
         if match is None:
-            print(f"[skip] {sheet_name} — 처리 대상 시트 아님")
+            print(f"[skip] {sheet_name} - 처리 대상 시트 아님")
             continue
 
         std_fn, category, theme = match
@@ -5738,9 +5845,18 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
                         usage2, std_unit2, note2 = convert_energy_unit(usage, std_unit, energy_name)
                         if std_unit2 == ef_unit:
                             usage, std_unit, unit_note = usage2, std_unit2, (unit_note + " → " + note2).strip(" → ")
+                        elif std_name and std_name != energy_name:
+                            # PATCH: DB에서 원래 연료(예: 도시가스(LNG))가 삭제되어 다른 연료의
+                            # EF로 대체 매칭된 경우(예: 천연가스(LNG)), 두 연료의 발열량(LHV)을
+                            # 거쳐 물리적으로 타당한 단위 환산(예: 도시가스 Nm³ → 천연가스 kg)을 시도한다.
+                            bridged, bridged_unit, bridge_note = _bridge_convert_via_lhv(
+                                usage, std_unit, energy_name, std_name, ef_unit)
+                            if bridged_unit == ef_unit:
+                                usage, std_unit, unit_note = bridged, bridged_unit, (unit_note + " → " + bridge_note).strip(" → ")
                     emission = (usage * ef_val / 1000) if (usage is not None and ef_val) else None
                     row2["배출계수(kgCO2eq/단위)"] = ef_val
                     row2["EF단위"] = ef_unit
+                    row2["EF매핑명"] = std_name
                     if unit_note:
                         row2["단위환산비고"] = unit_note
                     row2["배출량(tCO2e)"] = emission
@@ -5979,7 +6095,7 @@ def process_template_inventory(input_file: str, output_file: str,
 def process_scope3_upload(input_file: str, output_file: str, forced_theme: Optional[str] = None, report_year: int = None):
     return process_template_inventory(input_file, output_file, forced_theme, report_year=report_year)
 
-print("✅ Theme router (v1 템플릿 대응) 로드 완료")
+print("[OK] Theme router (v1 템플릿 대응) 로드 완료")
 print("   새 템플릿(C1~C15 시트): process_new_template() 자동 실행")
 print("   구 템플릿: 기존 테마 라우터 유지")
 print("   사용법: process_template_inventory(input_file, output_file)")
@@ -6189,7 +6305,7 @@ def refresh_transport_ef_map():
     except Exception:
         pass
     TRANSPORT_EF_MAP = base
-    print(f"✅ TRANSPORT_EF_MAP 갱신: {TRANSPORT_EF_MAP}")
+    print(f"[OK] TRANSPORT_EF_MAP 갱신: {TRANSPORT_EF_MAP}")
     return TRANSPORT_EF_MAP
 
 def calc_transport(row):
@@ -6691,7 +6807,7 @@ try:
 except Exception:
     pass
 
-print("✅ 사용자 검증 반영 패치 로드 완료")
+print("[OK] 사용자 검증 반영 패치 로드 완료")
 print("   - C4/C9 거리·금액, C6 Spend, C12 헤더/보조목록, C8/C13/C11 계산식 보강")
 
 # ── [원본 셀 47] ─────────────────────────────────────────────
@@ -6800,7 +6916,7 @@ def refresh_integrated_ef_db_mapping_patch():
 
 try:
     _reload_summary = refresh_integrated_ef_db_mapping_patch()
-    print(f"✅ 통합 DB 헤더 자동 보정/재로드 완료: {_reload_summary}")
+    print(f"[OK] 통합 DB 헤더 자동 보정/재로드 완료: {_reload_summary}")
 except Exception as e:
     print(f"[경고] 통합 DB 자동 재로드 스킵: {e}")
 
@@ -7080,6 +7196,14 @@ def lookup_energy_ef(energy_name: str, unit_hint: str = None):
         ef = pd.to_numeric(row.get(ef_col), errors="coerce")
         raw_name = row.get(name_col) if name_col else None
         raw_unit = row.get(unit_col) if unit_col else None
+
+        # PATCH: DB "투입량 기준단위"가 TJ인 항목(예: 열(스팀) = 59,685 kgCO2eq/TJ)은
+        # ENERGY_BASE_UNIT/convert_energy_unit이 전부 GJ 기준으로 사용량을 환산하므로,
+        # EF를 여기서 GJ 기준으로 정규화하지 않으면 사용량(GJ) × EF(/TJ)가 1000배 부풀려진다.
+        if pd.notna(ef) and raw_unit and str(raw_unit).strip().upper() == "TJ":
+            ef = ef / 1000.0
+            raw_unit = "GJ"
+
         _LAST_EF_MATCH_INFO["energy"] = {
             "input": _ef_safe_text(energy_name),
             "unit_hint": _ef_safe_text(unit_hint),
@@ -7345,7 +7469,7 @@ try:
 except Exception:
     pass
 
-print("✅ 템플릿 표시명 ↔ 배출계수 raw명 매핑 패치 적용 완료")
+print("[OK] 템플릿 표시명 ↔ 배출계수 raw명 매핑 패치 적용 완료")
 print("   - 에너지: 전기/전력/LNG/LPG/스팀/등유 등 사용자 친화명 → DB raw명 자동 매핑")
 print("   - 운송: 외항선/컨테이너선/벌크/택배/항공화물 등 → 표준코드 자동 매핑")
 print("   - 출력 검증 컬럼: EF매핑명, EF매핑방식, EF매핑점수")
@@ -7518,7 +7642,7 @@ def _reload_spend_ef_dbs_for_report_year(report_year=None):
             except Exception:
                 pass
 
-    print(f"✅ 구매_USEPA spend_db 재로딩: {len(spend_db)}행")
+    print(f"[OK] 구매_USEPA spend_db 재로딩: {len(spend_db)}행")
     print(f"   - 보고연도: {year}년")
     print(f"   - 적용 EF 컬럼: {globals().get('USEPA_SPEND_EF_COL')}")
     print("   - 계산 방식: 구매금액(KRW) × EF(kgCO2e/KRW)")
@@ -7670,7 +7794,7 @@ def calc_travel_spend_emission(row) -> dict:
 # 현재 기본 기준연도에 맞춰 즉시 1회 재로딩
 try:
     _reload_spend_ef_dbs_for_report_year(globals().get("FX_REFERENCE_YEAR", 2025))
-    print("✅ 기계산 KRW EF 직접 매핑 패치 적용 완료")
+    print("[OK] 기계산 KRW EF 직접 매핑 패치 적용 완료")
 except Exception as e:
     print(f"[경고] 기계산 KRW EF 패치 초기화 실패: {e}")
     print("       통합 DB 파일 경로 또는 구매_USEPA 시트의 EF (kgCO2e/KRW) 컬럼을 확인하세요.")
@@ -8229,8 +8353,24 @@ def calc_commute(row):
     workdays = _fix_num(row.get("근무일수")) or 245
     mode = normalize_commute_mode(row.get("교통수단") or row.get("이동수단"))
     if distance is None and _fix_text(row.get("출발지")) and _fix_text(row.get("도착지")):
+        geo_mode = "rail" if mode in ["train", "subway"] else "road"
         try:
-            distance = get_distance_km(row.get("출발지"), row.get("도착지"), mode="rail" if mode in ["train", "subway"] else "road")
+            distance = get_distance_km(row.get("출발지"), row.get("도착지"), mode=geo_mode)
+            # PATCH: 통근은 매일 반복되는 이동이라 편도 100km를 넘는 경우가 드물다.
+            # 지오코딩이 주소에 시/도 정보가 빠져있는 등의 이유로 동명이지(同名異地)를
+            # 잘못 매칭해 비현실적으로 큰 거리가 나오는 사례가 다수 발견되어,
+            # 100km를 초과하면 AI에게 별도로 재추정을 요청해 교차검증한다.
+            if distance is not None and distance > 100:
+                ai_straight = _ai_estimate_straight_km(
+                    row.get("출발지"), row.get("도착지"), country_hint="KR",
+                )
+                if ai_straight is not None:
+                    ai_distance = validate_distance_km(
+                        ai_straight * _DISTANCE_MODE_FACTOR.get(geo_mode, 1.0),
+                        mode=geo_mode, country_hint="KR",
+                    )
+                    if ai_distance is not None:
+                        distance = ai_distance
         except Exception:
             distance = None
     mode_text = _fix_text(row.get("교통수단") or row.get("이동수단")).lower()
@@ -8439,7 +8579,7 @@ def _postprocess_scope3_result_file(output_file):
         for sname, df in fixed.items():
             df.to_excel(writer, sheet_name=sname[:31], index=False)
     os.replace(tmp, output_file)
-    print("✅ 결과 후처리 완료: C1/C2 단위, C6/C7 산식, C11/C14 에너지 계산 보정")
+    print("[OK] 결과 후처리 완료: C1/C2 단위, C6/C7 산식, C11/C14 에너지 계산 보정")
 
 
 _ORIGINAL_process_new_template_FULL_FIX = globals().get("process_new_template")
@@ -8451,7 +8591,7 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
     _postprocess_scope3_result_file(output_file)
     return result
 
-print("✅ Full fix patch loaded: C1/C2 tCO2e, EF keyword ranking, C6/C7 formulas, C11/C14 energy calculation, unit-safe gas mapping")
+print("[OK] Full fix patch loaded: C1/C2 tCO2e, EF keyword ranking, C6/C7 formulas, C11/C14 energy calculation, unit-safe gas mapping")
 
 # ── [원본 셀 52] ─────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
@@ -8536,7 +8676,7 @@ def calc_c12_ef_and_emission(row) -> dict:
     return {"배출계수": weighted_ef, "배출량(tCO2e)": emission}
 
 
-print("✅ calc_c12_ef_and_emission() 로드 완료 — C12 배출계수를 폐기물_C12 DB 코드 매칭으로 계산합니다.")
+print("[OK] calc_c12_ef_and_emission() 로드 완료 - C12 배출계수를 폐기물_C12 DB 코드 매칭으로 계산합니다.")
 
 # ── [원본 셀 53] ─────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
@@ -8552,7 +8692,7 @@ print("✅ calc_c12_ef_and_emission() 로드 완료 — C12 배출계수를 폐�
 # ══════════════════════════════════════════════════════════════
 energy_c3_ef_db = _load_ef_sheet("에너지_C3", header_row=2)
 energy_c3_ef_db.columns = [str(c).strip() for c in energy_c3_ef_db.columns]
-print(f"✅ energy_c3_ef_db (배출계수_통합_DB.xlsx > 에너지_C3): {len(energy_c3_ef_db)}행")
+print(f"[OK] energy_c3_ef_db (배출계수_통합_DB.xlsx > 에너지_C3): {len(energy_c3_ef_db)}행")
 
 
 def _c3_norm(x):
@@ -8648,7 +8788,35 @@ def lookup_energy_ef_c3(energy_name: str, unit_hint: str = None):
     return None, None, None
 
 
-print("✅ lookup_energy_ef_c3() 로드 완료 — C3 계산에서 이 함수를 사용하도록 연결됩니다.")
+def _bridge_convert_via_lhv(value, value_unit, from_energy_name, to_energy_name, to_unit):
+    """
+    DB에서 원래 연료(from_energy_name, 예: 도시가스(LNG))의 EF가 삭제되어
+    다른 연료(to_energy_name, 예: 천연가스(LNG))의 EF로 대체 매칭됐을 때,
+    두 연료 각각의 발열량(LHV, MJ/단위)을 거쳐 value_unit(예: Nm³) → to_unit(예: kg)으로
+    물리적으로 타당하게 환산한다. (동일한 열량을 갖는다고 가정)
+    조건이 안 맞으면(LHV 정보 없음/단위 불일치) 환산하지 않고 원본 그대로 반환한다.
+    """
+    def _u_norm(u):
+        return str(u or "").strip().lower().replace(" ", "").replace("³", "3").replace("²", "2")
+
+    from_info = ENERGY_BASE_UNIT.get(_detect_energy_name(from_energy_name))
+    to_info = ENERGY_BASE_UNIT.get(_detect_energy_name(to_energy_name))
+    if not from_info or not to_info:
+        return value, value_unit, ""
+
+    from_unit, from_lhv = from_info
+    to_unit_expected, to_lhv = to_info
+    if from_lhv is None or to_lhv is None or to_lhv <= 0:
+        return value, value_unit, ""
+    if _u_norm(value_unit) != _u_norm(from_unit) or _u_norm(to_unit) != _u_norm(to_unit_expected):
+        return value, value_unit, ""
+
+    converted = value * from_lhv / to_lhv
+    note = f"{value_unit}→{to_unit} (발열량 환산: {from_energy_name}→{to_energy_name}, ×{(from_lhv / to_lhv):.6g})"
+    return converted, to_unit, note
+
+
+print("[OK] lookup_energy_ef_c3() 로드 완료 - C3 계산에서 이 함수를 사용하도록 연결됩니다.")
 
 # ── [원본 셀 58] ─────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════
