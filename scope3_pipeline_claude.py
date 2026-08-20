@@ -1456,7 +1456,55 @@ JSON으로만 답하라: {{"distance_km": <숫자>}}"""
     parsed = _call_claude_json(prompt, max_tokens=60)
     return to_float(parsed.get("distance_km")) if parsed else None
 
-_DISTANCE_MODE_FACTOR = {"road": 1.3, "parcel": 1.35, "air": 1.05, "sea": 1.30, "rail": 1.20}
+_DISTANCE_MODE_FACTOR = {"road": 1.3, "parcel": 1.35, "air": 1.09, "sea": 1.30, "rail": 1.20}
+# air: 1.05 -> 1.09로 상향. ICAO Carbon Calculator / DEFRA 방법론에서 실제 비행경로가
+# 관제 대기·우회 등으로 대권거리(great-circle distance)보다 약 8~9% 더 길다고 보는
+# 우회보정(circuity/uplift)을 반영 (Climatiq/ICAO 벤치마킹 결과).
+
+_AIRPORT_TEXT_HINTS = ["공항", "airport", "국제공항", "terminal"]
+
+def _looks_like_airport(text: str) -> bool:
+    """출발지/도착지 텍스트가 이미 '공항'을 가리키는지 판별 (공항명 또는 3자리 IATA 코드)."""
+    t = _safe_text2(text)
+    if not t:
+        return False
+    if _contains_any(t.lower(), _AIRPORT_TEXT_HINTS):
+        return True
+    return bool(re.fullmatch(r"[A-Za-z]{3}", t.strip()))
+
+
+@lru_cache(maxsize=512)
+def _ai_nearest_airport(location: str, country_hint: str = "KR"):
+    """
+    항공편 출발지/도착지가 공항이 아니라 주소·지명으로 입력됐을 때,
+    그 지역에서 실제로 정기 여객노선을 운항하는 가장 가까운 주요 공항을 AI로 추정한다.
+    (단순 최단거리 활주로가 아니라, 실제로 항공권을 끊어 이용할 만한 공항을 우선)
+    이후 이 공항 이름을 다시 지오코딩해서 좌표를 구하고, 그 좌표 간 대권거리로
+    항공 이동거리를 계산한다 (주소-대-주소 직선거리를 쓰지 않기 위함).
+    """
+    prompt = f"""아래 지역에서 국내선/국제선 항공편을 이용한다면 가장 가까운, 실제로 정기 여객노선이 있는
+주요 공항의 이름을 알려줘. 단순히 지리적으로 제일 가까운 소형 비행장이 아니라
+사람들이 실제로 항공권을 구매해 이용하는 공항을 골라라.
+
+지역: {location}
+국가 힌트: {country_hint}
+
+JSON으로만 답하라: {{"airport_name": "<공항 정식 명칭, 국가 포함>", "iata": "<IATA 코드, 모르면 빈 문자열>"}}"""
+    parsed = _call_claude_json(prompt, max_tokens=80)
+    if not parsed:
+        return None
+    name = _safe_text2(parsed.get("airport_name"))
+    return name or None
+
+
+def _resolve_air_location(text: str, country_hint: str = "KR") -> str:
+    """항공 모드일 때 출발지/도착지를 '공항명'으로 정규화 (이미 공항이면 그대로 둠)."""
+    text = _safe_text2(text)
+    if not text or _looks_like_airport(text):
+        return text
+    airport = _ai_nearest_airport(text, country_hint=country_hint)
+    return airport or text
+
 
 # ---------------------------
 # 기존 코드 호환용 get_distance_km
@@ -1469,12 +1517,21 @@ def get_distance_km(origin, dest, mode="road", country_hint="KR"):
     행마다 서로 다른 기준(직선거리 기반 vs 실거리 기반)이 섞여 있었다.
     지오코딩 성공 여부와 무관하게 "직선거리를 구한 뒤 동일한 보정계수를 곱하는"
     한 가지 방식으로 통일한다 (지오코딩 우선, 실패 시에만 AI가 직선거리를 추정).
+
+    PATCH2: mode="air"인데 출발지/도착지가 공항이 아니라 주소·지명이면,
+    그 좌표를 그대로 지오코딩해 직선거리를 재는 대신(과대/과소산정 원인),
+    먼저 각 지점에서 가장 가까운 주요 공항으로 치환한 뒤 그 공항들 사이의
+    거리를 계산한다 (Climatiq/ICAO 벤치마킹 결과 반영).
     """
     origin = _safe_text2(origin)
     dest = _safe_text2(dest)
 
     if not origin or not dest:
         return None
+
+    if mode == "air":
+        origin = _resolve_air_location(origin, country_hint=country_hint)
+        dest = _resolve_air_location(dest, country_hint=country_hint)
 
     factor = _DISTANCE_MODE_FACTOR.get(mode, 1.0)
 
