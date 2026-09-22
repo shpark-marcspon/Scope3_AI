@@ -5860,6 +5860,17 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
                 print(f"  [empty] {sheet_name}")
                 continue
             df = std_fn(df)
+
+            # 엑셀 자동매칭 수식이 재계산되지 않아 비어있는 경우를 대비한 폴백
+            if category == "Category5":
+                df = _fill_missing_from_company_mapping(
+                    df, input_file, "회사별_폐기물매핑",
+                    detail_col="상세폐기물명", target_cols="폐기물 종류")
+            elif category in ("Category6", "Category7") and "상세 교통수단명(선택)" in df.columns:
+                df = _fill_missing_from_company_mapping(
+                    df, input_file, "회사별_교통수단매핑",
+                    detail_col="상세 교통수단명(선택)", target_cols=["이동수단", "교통수단"])
+
             df["자동카테고리"] = category
             df["출처시트"] = sheet_name
 
@@ -6186,6 +6197,65 @@ def standardize_travel_business_sheet(df: pd.DataFrame) -> pd.DataFrame:
 # 구버전 호환: standardize_travel_commute_sheet
 def standardize_travel_commute_sheet(df: pd.DataFrame) -> pd.DataFrame:
     return standardize_c7_sheet(df)
+
+
+# ─────────────────────────────────────────
+# 회사별 자동매칭(엑셀 수식) 미계산 대비 폴백
+# ─────────────────────────────────────────
+# C5/C6-1/C7 템플릿의 "폐기물 종류"/"교통수단"은 엑셀 안에서
+# =IFERROR(INDEX(회사별_○○매핑!..., MATCH(...))) 수식으로 자동 채워지도록 되어 있는데,
+# 이 수식은 실제 엑셀에서 한 번 열어 재계산·저장해야 캐시값이 생긴다.
+# 파일이 재계산 없이(예: openpyxl로 만들어졌거나, 코랩에 그대로 업로드) 넘어오면
+# pandas는 그 셀을 빈 값으로 읽고, 결과에서도 배출계수/배출량 컬럼이 통째로 비어
+# (전부 NaN이라 출력 단계에서 컬럼 자체가 삭제됨) 계산이 안 되는 것처럼 보인다.
+# 그래서 수식 결과에 의존하지 않고, 매핑 시트(회사별_○○매핑)와 표지(기업정보!C7의
+# 선택된 회사)를 파이썬에서 직접 읽어 같은 매칭을 다시 수행해 빈 값만 보충한다.
+def _fill_missing_from_company_mapping(df: pd.DataFrame, input_file: str,
+                                         mapping_sheet: str, detail_col: str,
+                                         target_cols) -> pd.DataFrame:
+    if isinstance(target_cols, str):
+        target_cols = [target_cols]
+    target_cols = [c for c in target_cols if c in df.columns]
+    if not target_cols or detail_col not in df.columns:
+        return df
+    if all(df[c].notna().all() and (df[c].astype(str).str.strip() != "").all() for c in target_cols):
+        return df  # 이미 다 채워져 있으면 매핑 시트를 읽을 필요 없음
+
+    try:
+        wb = openpyxl.load_workbook(input_file, data_only=True, read_only=True)
+    except Exception:
+        return df
+    if mapping_sheet not in wb.sheetnames or "기업정보" not in wb.sheetnames:
+        return df
+
+    company = wb["기업정보"]["C7"].value
+    company = str(company).strip() if company else None
+    if not company:
+        return df
+
+    ws = wb[mapping_sheet]
+    mapping = {}
+    for row in ws.iter_rows(min_row=2, max_col=3, values_only=True):
+        if len(row) < 3:
+            continue
+        c, k, v = row[0], row[1], row[2]
+        if c is not None and k is not None and v is not None and str(c).strip() == company:
+            key = str(k).strip().lower()
+            if key:
+                mapping[key] = str(v).strip()
+    if not mapping:
+        return df
+
+    df = df.copy()
+    detail_series = df[detail_col].astype(str).str.strip().str.lower()
+    for target_col in target_cols:
+        cur = df[target_col]
+        blank_mask = cur.isna() | (cur.astype(str).str.strip() == "") | (cur.astype(str).str.strip().str.lower() == "none")
+        if not blank_mask.any():
+            continue
+        filled = detail_series.map(mapping)
+        df.loc[blank_mask, target_col] = filled[blank_mask]
+    return df
 
 
 # ─────────────────────────────────────────
