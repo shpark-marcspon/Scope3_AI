@@ -298,6 +298,69 @@ print(f"[OK] travel_spend_db:    {len(travel_spend_db)}행")
 # ── 환경부 전체 평균 EF (처리방법 미입력/매핑 없음 시) ──────
 WASTE_AVG_EF = {"매립": 0.175965929, "소각": 1.176142131, "재활용": 0.029390317}
 
+# ── 생물기원(바이오매스) 분리: 음식물/폐지류/폐목재류의 "소각" 항목만 ────────
+# 소각 배출량 중 화석탄소비율(FCF)만큼은 화석기원, 나머지 (1-FCF)는 생물기원으로 구분한다.
+#   C5 : 폐기물 발생량 × 처리방법별 배출계수 × (1-FCF)                      -> 생물기원
+#   C12: 판매수량 × 제품중량 × 폐기방식 비율 × 폐기방식별 배출계수 × (1-FCF) -> 생물기원
+# 출처: 환경부 온실가스 배출권거래제의 배출량 보고 및 인증에 관한 지침 제18조 1항, IPCC 2006 GL Vol.5.
+# FCF 값은 IPCC 2006 Vol.5 Table 2.4 기본값(종이/판지 1%, 음식물·목재는 화석탄소 없음)으로 넣어둔 것이므로
+# 지침 별표 값과 다르면 아래 dict만 수정하면 C5/C12에 모두 반영된다.
+BIOGENIC_WASTE_FCF = {"음식물류": 0.0, "폐지류": 0.01, "폐목재류": 0.0}
+
+# C12 폐기물 코드(중분류/소분류 앞부분) -> 생물기원 대상 그룹
+_BIOGENIC_C12_CODE_PREFIX = (
+    ("51-21", "음식물류"), ("91-01", "음식물류"),
+    ("51-03", "폐지류"),   ("91-02", "폐지류"),
+    ("51-04", "폐목재류"), ("91-08", "폐목재류"), ("91-09", "폐목재류"),  # 91-08 폐가구류는 목재 EF와 동일
+)
+
+
+def _biogenic_group_from_name(name):
+    """폐기물 종류/제품명 텍스트 -> '음식물류'/'폐지류'/'폐목재류' (해당 없으면 None)"""
+    s = str(name if name is not None else "").strip().lower().replace(" ", "")
+    if not s or s == "nan":
+        return None
+    if any(k in s for k in ("음식물", "식품", "food")):
+        return "음식물류"
+    if any(k in s for k in ("폐지", "골판지", "신문지", "종이", "paper")):
+        return "폐지류"
+    if any(k in s for k in ("폐목", "목재", "팔레트", "wood")):
+        return "폐목재류"
+    return None
+
+
+def _biogenic_group_from_code(code):
+    """C12 폐기물 중분류/소분류 코드 -> 생물기원 대상 그룹 (해당 없으면 None)"""
+    c = str(code if code is not None else "").strip()
+    for prefix, group in _BIOGENIC_C12_CODE_PREFIX:
+        if c.startswith(prefix):
+            return group
+    return None
+
+
+def biogenic_fossil_split(total_tco2e, incineration_tco2e, group):
+    """
+    total_tco2e       : 전체 배출량(tCO2e)
+    incineration_tco2e: 그 중 소각에서 발생한 부분(tCO2e)
+    group             : 생물기원 대상 그룹(없으면 None)
+    반환: 화석기원/생물기원 배출량(tCO2e), FCF, 구분 설명
+      생물기원 = 소각 배출량 × (1-FCF),  화석기원 = 전체 - 생물기원
+    """
+    if total_tco2e is None:
+        return {"화석기원 CO2e(tCO2e)": None, "생물기원 CO2e(tCO2e)": None,
+                "화석탄소비율(FCF)": None, "바이오매스 구분": None}
+    fcf = BIOGENIC_WASTE_FCF.get(group) if group else None
+    if fcf is None or not incineration_tco2e:
+        return {"화석기원 CO2e(tCO2e)": total_tco2e, "생물기원 CO2e(tCO2e)": 0.0,
+                "화석탄소비율(FCF)": None, "바이오매스 구분": "해당없음"}
+    bio = incineration_tco2e * (1 - fcf)
+    return {
+        "화석기원 CO2e(tCO2e)": total_tco2e - bio,
+        "생물기원 CO2e(tCO2e)": bio,
+        "화석탄소비율(FCF)": fcf,
+        "바이오매스 구분": f"{group} 소각: 생물기원 {(1 - fcf) * 100:g}% / 화석기원 {fcf * 100:g}%",
+    }
+
 # ── 운송 EF 맵 (코드 → kgCO2eq/ton·km) ──────────────────────
 def _build_transport_ef_map_from_db():
     if transport_ef_db.empty:
@@ -5944,9 +6007,15 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
 
                     ef_val = lookup_waste_ef(waste_name, treatment) if waste_name else None
                     emission = (usage_kg * ef_val / 1000) if (usage_kg and ef_val) else None
+                    treatment_std = _normalize_treatment(treatment)
                     row2["배출계수(kgCO2eq/kg)"] = ef_val
-                    row2["처리방법_정규화"] = _normalize_treatment(treatment)
-                    row2["배출량(tCO2e)"] = emission
+                    row2["처리방법_정규화"] = treatment_std
+                    # 음식물/폐지류/폐목재류 "소각"만 생물기원·화석기원으로 분리하고,
+                    # 배출량(tCO2e)에는 화석기원분만 남긴다 (생물기원 CO2는 Scope 3 집계에서 제외)
+                    bio_group = _biogenic_group_from_name(waste_name) if treatment_std == "소각" else None
+                    for _k, _v in biogenic_fossil_split(emission, emission, bio_group).items():
+                        row2[_k] = _v
+                    row2["배출량(tCO2e)"] = row2["화석기원 CO2e(tCO2e)"]
                     rows_out.append(row2)
                 df = pd.DataFrame(rows_out)
 
@@ -5986,6 +6055,10 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
                         _c12_result = _c12_fn(row2)
                         row2["배출계수"] = _c12_result.get("배출계수")
                         row2["배출량(tCO2e)"] = _c12_result.get("배출량(tCO2e)")
+                        for _k in ("화석기원 CO2e(tCO2e)", "생물기원 CO2e(tCO2e)",
+                                   "화석탄소비율(FCF)", "바이오매스 구분"):
+                            if _k in _c12_result:
+                                row2[_k] = _c12_result[_k]
                     else:
                         row2["배출량(tCO2e)"] = calc_c12_emission(row2)
                     rows_out.append(row2)
@@ -8730,7 +8803,25 @@ def calc_c12_ef_and_emission(row) -> dict:
             weighted_ef += ef_rec * pct_rec
 
     emission = total_weight_kg * weighted_ef / 1000.0
-    return {"배출계수": weighted_ef, "배출량(tCO2e)": emission}
+
+    # 음식물/폐지류/폐목재류의 "소각" 배출분만 생물기원·화석기원으로 분리
+    # (처리비중이 하나도 없어 평균 EF로 계산한 경우에는 소각 비중을 알 수 없으므로 분리하지 않음)
+    bio_group = None
+    incineration_part = None
+    if not (pct_lf is None and pct_inc is None and pct_rec is None):
+        code = sub or mid
+        if code:
+            bio_group = _biogenic_group_from_code(code)
+        elif product and not big:
+            bio_group = _biogenic_group_from_name(product)
+        if bio_group and pct_inc is not None and ef_inc is not None:
+            incineration_part = total_weight_kg * pct_inc * ef_inc / 1000.0
+
+    result = {"배출계수": weighted_ef, "배출량(tCO2e)": emission}
+    result.update(biogenic_fossil_split(emission, incineration_part, bio_group))
+    # 생물기원 CO2는 Scope 3 집계에서 제외 -> 배출량(tCO2e)에는 화석기원분만 남긴다
+    result["배출량(tCO2e)"] = result["화석기원 CO2e(tCO2e)"]
+    return result
 
 
 print("[OK] calc_c12_ef_and_emission() 로드 완료 - C12 배출계수를 폐기물_C12 DB 코드 매칭으로 계산합니다.")
