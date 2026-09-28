@@ -111,9 +111,10 @@ def infer_scope3_category_llm(row, sheet_name):
 """
 
     res = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-6-sol",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0
+        reasoning_effort="low",
+        max_completion_tokens=300,
     )
 
     result = res.choices[0].message.content.strip()
@@ -214,6 +215,69 @@ print(f"✅ travel_spend_db:    {len(travel_spend_db)}행")
 
 # ── 환경부 전체 평균 EF (처리방법 미입력/매핑 없음 시) ──────
 WASTE_AVG_EF = {"매립": 0.175965929, "소각": 1.176142131, "재활용": 0.029390317}
+
+# ── 생물기원(바이오매스) 분리: 음식물/폐지류/폐목재류의 "소각" 항목만 ────────
+# 소각 배출량 중 화석탄소비율(FCF)만큼은 화석기원, 나머지 (1-FCF)는 생물기원으로 구분한다.
+#   C5 : 폐기물 발생량 × 처리방법별 배출계수 × (1-FCF)                      -> 생물기원
+#   C12: 판매수량 × 제품중량 × 폐기방식 비율 × 폐기방식별 배출계수 × (1-FCF) -> 생물기원
+# 출처: 환경부 온실가스 배출권거래제의 배출량 보고 및 인증에 관한 지침 제18조 1항, IPCC 2006 GL Vol.5.
+# FCF 값은 IPCC 2006 Vol.5 Table 2.4 기본값(종이/판지 1%, 음식물·목재는 화석탄소 없음)으로 넣어둔 것이므로
+# 지침 별표 값과 다르면 아래 dict만 수정하면 C5/C12에 모두 반영된다.
+BIOGENIC_WASTE_FCF = {"음식물류": 0.0, "폐지류": 0.01, "폐목재류": 0.0}
+
+# C12 폐기물 코드(중분류/소분류 앞부분) -> 생물기원 대상 그룹
+_BIOGENIC_C12_CODE_PREFIX = (
+    ("51-21", "음식물류"), ("91-01", "음식물류"),
+    ("51-03", "폐지류"),   ("91-02", "폐지류"),
+    ("51-04", "폐목재류"), ("91-08", "폐목재류"), ("91-09", "폐목재류"),  # 91-08 폐가구류는 목재 EF와 동일
+)
+
+
+def _biogenic_group_from_name(name):
+    """폐기물 종류/제품명 텍스트 -> '음식물류'/'폐지류'/'폐목재류' (해당 없으면 None)"""
+    s = str(name if name is not None else "").strip().lower().replace(" ", "")
+    if not s or s == "nan":
+        return None
+    if any(k in s for k in ("음식물", "식품", "food")):
+        return "음식물류"
+    if any(k in s for k in ("폐지", "골판지", "신문지", "종이", "paper")):
+        return "폐지류"
+    if any(k in s for k in ("폐목", "목재", "팔레트", "wood")):
+        return "폐목재류"
+    return None
+
+
+def _biogenic_group_from_code(code):
+    """C12 폐기물 중분류/소분류 코드 -> 생물기원 대상 그룹 (해당 없으면 None)"""
+    c = str(code if code is not None else "").strip()
+    for prefix, group in _BIOGENIC_C12_CODE_PREFIX:
+        if c.startswith(prefix):
+            return group
+    return None
+
+
+def biogenic_fossil_split(total_tco2e, incineration_tco2e, group):
+    """
+    total_tco2e       : 전체 배출량(tCO2e)
+    incineration_tco2e: 그 중 소각에서 발생한 부분(tCO2e)
+    group             : 생물기원 대상 그룹(없으면 None)
+    반환: 화석기원/생물기원 배출량(tCO2e), FCF, 구분 설명
+      생물기원 = 소각 배출량 × (1-FCF),  화석기원 = 전체 - 생물기원
+    """
+    if total_tco2e is None:
+        return {"화석기원 CO2e(tCO2e)": None, "생물기원 CO2e(tCO2e)": None,
+                "화석탄소비율(FCF)": None, "바이오매스 구분": None}
+    fcf = BIOGENIC_WASTE_FCF.get(group) if group else None
+    if fcf is None or not incineration_tco2e:
+        return {"화석기원 CO2e(tCO2e)": total_tco2e, "생물기원 CO2e(tCO2e)": 0.0,
+                "화석탄소비율(FCF)": None, "바이오매스 구분": "해당없음"}
+    bio = incineration_tco2e * (1 - fcf)
+    return {
+        "화석기원 CO2e(tCO2e)": total_tco2e - bio,
+        "생물기원 CO2e(tCO2e)": bio,
+        "화석탄소비율(FCF)": fcf,
+        "바이오매스 구분": f"{group} 소각: 생물기원 {(1 - fcf) * 100:g}% / 화석기원 {fcf * 100:g}%",
+    }
 
 # ── 운송 EF 맵 (코드 → kgCO2eq/ton·km) ──────────────────────
 def _build_transport_ef_map_from_db():
@@ -419,6 +483,11 @@ _TREATMENT_ALIAS = {
     "매립": "매립", "land": "매립", "landfill": "매립",
     "소각": "소각", "incineration": "소각", "incinerator": "소각", "inc": "소각",
     "재활용": "재활용", "recycling": "재활용", "recycle": "재활용", "rec": "재활용",
+    # PATCH: "기타"가 별칭에 없으면 _normalize_treatment()가 None을 반환하고,
+    # lookup_waste_ef()의 처리방법 필터가 빈 문자열과 비교돼 DB에 폐기물종류별로
+    # 정확히 정의된 "기타" 행(예: 폐콘크리트류+기타→매립평균)을 아예 찾지 못한 채
+    # 무조건 WASTE_AVG_EF["소각"]로 떨어지는 문제가 있었다.
+    "기타": "기타", "other": "기타", "etc": "기타",
 }
 
 def _normalize_waste_name(raw: str) -> str:
@@ -838,9 +907,10 @@ def normalize_city(city):
     """
 
     res = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-6-sol",
         messages=[{"role":"user","content":prompt}],
-        temperature=0
+        reasoning_effort="low",
+        max_completion_tokens=300,
     )
 
     return res.choices[0].message.content.strip()
@@ -1320,7 +1390,7 @@ car
 """
 
         res = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-6-sol",
             messages=[
                 {
                     "role": "system",
@@ -1331,7 +1401,8 @@ car
                     "content": prompt
                 }
             ],
-            temperature=0
+            reasoning_effort="low",
+            max_completion_tokens=300,
         )
 
         out = res.choices[0].message.content.strip().lower()
@@ -1369,11 +1440,102 @@ def _kg_to_ton(weight_kg):
         return None
     return w / 1000.0
 
+
+# ── 항공 이동거리: 주소가 아니라 공항 기준으로 계산 ──────────────
+# 출도착지가 공항이 아니라 주소·지명으로 입력되면, 그 좌표를 그대로 지오코딩해
+# 직선거리를 재는 대신(과대/과소산정 원인 — Climatiq/ICAO 벤치마킹 결과), 먼저
+# 각 지점에서 가장 가까운 주요 공항으로 치환한 뒤 그 공항들 사이의 거리를 계산한다.
+def _call_openai_json(prompt, max_tokens=400):
+    """
+    JSON 응답을 요구하는 OpenAI 호출. 실패하면 None.
+    gpt-6-sol는 추론모델이라 max_completion_tokens 예산을 내부 reasoning
+    토큰이 먼저 소비한다 — 너무 작게 주면(예: 80) reasoning만 하다 끝나서
+    실제 출력(content)이 빈 문자열로 잘리므로(finish_reason="length") 여유 있게 잡고,
+    reasoning_effort="low"로 이 간단한 분류/조회 작업에 불필요한 추론을 줄인다.
+    """
+    try:
+        res = client.chat.completions.create(
+            model="gpt-6-sol",
+            messages=[
+                {"role": "system", "content": "Return only valid JSON, with no other text before or after it."},
+                {"role": "user", "content": prompt},
+            ],
+            reasoning_effort="low",
+            max_completion_tokens=max_tokens,
+        )
+        text = res.choices[0].message.content.strip()
+    except Exception:
+        return None
+    import json as _json
+    try:
+        return _json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return _json.loads(m.group(0))
+            except Exception:
+                return None
+        return None
+
+
+_AIRPORT_TEXT_HINTS = ["공항", "airport", "국제공항", "terminal"]
+
+
+def _looks_like_airport(text: str) -> bool:
+    """출발지/도착지 텍스트가 이미 '공항'을 가리키는지 판별 (공항명 또는 3자리 IATA 코드)."""
+    t = _safe_text2(text)
+    if not t:
+        return False
+    if _contains_any(t.lower(), _AIRPORT_TEXT_HINTS):
+        return True
+    return bool(re.fullmatch(r"[A-Za-z]{3}", t.strip()))
+
+
+def _ai_nearest_airport(location: str, country_hint: str = "KR"):
+    """
+    항공편 출발지/도착지가 공항이 아니라 주소·지명으로 입력됐을 때,
+    그 지역에서 실제로 정기 여객노선을 운항하는 가장 가까운 주요 공항을 AI로 추정한다.
+    (단순 최단거리 활주로가 아니라, 실제로 항공권을 끊어 이용할 만한 공항을 우선)
+    이후 이 공항 이름을 다시 지오코딩해서 좌표를 구하고, 그 좌표 간 대권거리로
+    항공 이동거리를 계산한다 (주소-대-주소 직선거리를 쓰지 않기 위함).
+    """
+    prompt = f"""아래 지역에서 국내선/국제선 항공편을 이용한다면 가장 가까운, 실제로 정기 여객노선이 있는
+주요 공항의 이름을 알려줘. 단순히 지리적으로 제일 가까운 소형 비행장이 아니라
+사람들이 실제로 항공권을 구매해 이용하는 공항을 골라라.
+
+지역: {location}
+국가 힌트: {country_hint}
+
+JSON으로만 답하라: {{"airport_name": "<공항 정식 명칭, 국가 포함>", "iata": "<IATA 코드, 모르면 빈 문자열>"}}"""
+    parsed = _call_openai_json(prompt, max_tokens=400)
+    if not parsed:
+        return None
+    name = _safe_text2(parsed.get("airport_name"))
+    return name or None
+
+
+def _resolve_air_location(text: str, country_hint: str = "KR") -> str:
+    """항공 모드일 때 출발지/도착지를 '공항명'으로 정규화 (이미 공항이면 그대로 둠)."""
+    text = _safe_text2(text)
+    if not text or _looks_like_airport(text):
+        return text
+    airport = _ai_nearest_airport(text, country_hint=country_hint)
+    return airport or text
+
+
 # ---------------------------
 # 기존 코드 호환용 get_distance_km
 # 기존 process_template_inventory / 출장 / 통근 함수에서 그대로 호출 가능
 # ---------------------------
 def get_distance_km(origin, dest, mode="road", country_hint="KR"):
+    """
+    PATCH: mode="air"인데 출발지/도착지가 공항이 아니라 주소·지명이면,
+    그 좌표를 그대로 지오코딩해 직선거리를 재는 대신(과대/과소산정 원인),
+    먼저 각 지점에서 가장 가까운 주요 공항으로 치환한 뒤 그 공항들 사이의
+    거리를 계산한다 (Climatiq/ICAO 벤치마킹 결과 반영). 우회보정도 1.05→1.09로 상향
+    (ICAO Carbon Calculator/DEFRA 방법론의 8~9% 우회보정 기준).
+    """
     origin = _safe_text2(origin)
     dest = _safe_text2(dest)
 
@@ -1386,15 +1548,20 @@ def get_distance_km(origin, dest, mode="road", country_hint="KR"):
         return validate_distance_km(d, mode=mode, country_hint=country_hint)
 
     # sea / air / rail
+    geo_origin, geo_dest = origin, dest
+    if mode == "air":
+        geo_origin = _resolve_air_location(origin, country_hint=country_hint)
+        geo_dest = _resolve_air_location(dest, country_hint=country_hint)
+
     straight = estimate_straight_distance(
-        origin, dest,
+        geo_origin, geo_dest,
         country_hint=country_hint if country_hint == "KR" else None
     )
     if straight is None:
         return None
 
     if mode == "air":
-        d = straight * 1.05
+        d = straight * 1.09
     elif mode == "sea":
         d = straight * 1.30
     elif mode == "rail":
@@ -2448,8 +2615,7 @@ def translate_product_for_search_info(product):
     )
 
     res = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        temperature=0,
+        model="gpt-6-sol",
         response_format={"type": "json_object"},
         messages=[
             {
@@ -2460,7 +2626,9 @@ def translate_product_for_search_info(product):
                 "role": "user",
                 "content": prompt
             }
-        ]
+        ],
+        reasoning_effort="low",
+        max_completion_tokens=800,
     )
 
     parsed = safe_json_loads(res.choices[0].message.content)
@@ -4368,10 +4536,10 @@ def _infer_group_name_llm(product_text: str) -> str:
 
 그룹명:"""
         res = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-6-sol",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=20,
+            reasoning_effort="low",
+            max_completion_tokens=300,
         )
         return res.choices[0].message.content.strip()
     except Exception:
@@ -5656,6 +5824,65 @@ def detect_upload_theme(input_file: str) -> str:
 
 
 # ─────────────────────────────────────────
+# 회사별 자동매칭(엑셀 수식) 미계산 대비 폴백
+# ─────────────────────────────────────────
+# C5/C6-1/C7 템플릿의 "폐기물 종류"/"교통수단"은 엑셀 안에서
+# =IFERROR(INDEX(회사별_○○매핑!..., MATCH(...))) 수식으로 자동 채워지도록 되어 있는데,
+# 이 수식은 실제 엑셀에서 한 번 열어 재계산·저장해야 캐시값이 생긴다.
+# 파일이 재계산 없이(예: openpyxl로 만들어졌거나, 코랩에 그대로 업로드) 넘어오면
+# pandas는 그 셀을 빈 값으로 읽고, 결과에서도 배출계수/배출량 컬럼이 통째로 비어
+# (전부 NaN이라 출력 단계에서 컬럼 자체가 삭제됨) 계산이 안 되는 것처럼 보인다.
+# 그래서 수식 결과에 의존하지 않고, 매핑 시트(회사별_○○매핑)와 표지(기업정보!C7의
+# 선택된 회사)를 파이썬에서 직접 읽어 같은 매칭을 다시 수행해 빈 값만 보충한다.
+def _fill_missing_from_company_mapping(df: pd.DataFrame, input_file: str,
+                                         mapping_sheet: str, detail_col: str,
+                                         target_cols) -> pd.DataFrame:
+    if isinstance(target_cols, str):
+        target_cols = [target_cols]
+    target_cols = [c for c in target_cols if c in df.columns]
+    if not target_cols or detail_col not in df.columns:
+        return df
+    if all(df[c].notna().all() and (df[c].astype(str).str.strip() != "").all() for c in target_cols):
+        return df  # 이미 다 채워져 있으면 매핑 시트를 읽을 필요 없음
+
+    try:
+        wb = openpyxl.load_workbook(input_file, data_only=True, read_only=True)
+    except Exception:
+        return df
+    if mapping_sheet not in wb.sheetnames or "기업정보" not in wb.sheetnames:
+        return df
+
+    company = wb["기업정보"]["C7"].value
+    company = str(company).strip() if company else None
+    if not company:
+        return df
+
+    ws = wb[mapping_sheet]
+    mapping = {}
+    for row in ws.iter_rows(min_row=2, max_col=3, values_only=True):
+        if len(row) < 3:
+            continue
+        c, k, v = row[0], row[1], row[2]
+        if c is not None and k is not None and v is not None and str(c).strip() == company:
+            key = str(k).strip().lower()
+            if key:
+                mapping[key] = str(v).strip()
+    if not mapping:
+        return df
+
+    df = df.copy()
+    detail_series = df[detail_col].astype(str).str.strip().str.lower()
+    for target_col in target_cols:
+        cur = df[target_col]
+        blank_mask = cur.isna() | (cur.astype(str).str.strip() == "") | (cur.astype(str).str.strip().str.lower() == "none")
+        if not blank_mask.any():
+            continue
+        filled = detail_series.map(mapping)
+        df.loc[blank_mask, target_col] = filled[blank_mask]
+    return df
+
+
+# ─────────────────────────────────────────
 # 새 템플릿 전용 처리 함수 - 모든 시트 일괄 처리
 # ─────────────────────────────────────────
 def process_new_template(input_file: str, output_file: str, report_year: int = None):
@@ -5736,6 +5963,17 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
                 print(f"  [empty] {sheet_name}")
                 continue
             df = std_fn(df)
+
+            # 엑셀 자동매칭 수식이 재계산되지 않아 비어있는 경우를 대비한 폴백
+            if category == "Category5":
+                df = _fill_missing_from_company_mapping(
+                    df, input_file, "회사별_폐기물매핑",
+                    detail_col="상세폐기물명", target_cols="폐기물 종류")
+            elif category in ("Category6", "Category7") and "상세 교통수단명(선택)" in df.columns:
+                df = _fill_missing_from_company_mapping(
+                    df, input_file, "회사별_교통수단매핑",
+                    detail_col="상세 교통수단명(선택)", target_cols=["이동수단", "교통수단"])
+
             df["자동카테고리"] = category
             df["출처시트"] = sheet_name
 
@@ -5873,9 +6111,15 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
 
                     ef_val = lookup_waste_ef(waste_name, treatment) if waste_name else None
                     emission = (usage_kg * ef_val / 1000) if (usage_kg and ef_val) else None
+                    treatment_std = _normalize_treatment(treatment)
                     row2["배출계수(kgCO2eq/kg)"] = ef_val
-                    row2["처리방법_정규화"] = _normalize_treatment(treatment)
-                    row2["배출량(tCO2e)"] = emission
+                    row2["처리방법_정규화"] = treatment_std
+                    # 음식물/폐지류/폐목재류 "소각"만 생물기원·화석기원으로 분리하고,
+                    # 배출량(tCO2e)에는 화석기원분만 남긴다 (생물기원 CO2는 Scope 3 집계에서 제외)
+                    bio_group = _biogenic_group_from_name(waste_name) if treatment_std == "소각" else None
+                    for _k, _v in biogenic_fossil_split(emission, emission, bio_group).items():
+                        row2[_k] = _v
+                    row2["배출량(tCO2e)"] = row2["화석기원 CO2e(tCO2e)"]
                     rows_out.append(row2)
                 df = pd.DataFrame(rows_out)
 
@@ -5915,6 +6159,10 @@ def process_new_template(input_file: str, output_file: str, report_year: int = N
                         _c12_result = _c12_fn(row2)
                         row2["배출계수"] = _c12_result.get("배출계수")
                         row2["배출량(tCO2e)"] = _c12_result.get("배출량(tCO2e)")
+                        for _k in ("화석기원 CO2e(tCO2e)", "생물기원 CO2e(tCO2e)",
+                                   "화석탄소비율(FCF)", "바이오매스 구분"):
+                            if _k in _c12_result:
+                                row2[_k] = _c12_result[_k]
                     else:
                         row2["배출량(tCO2e)"] = calc_c12_emission(row2)
                     rows_out.append(row2)
@@ -8712,7 +8960,25 @@ def calc_c12_ef_and_emission(row) -> dict:
             weighted_ef += ef_rec * pct_rec
 
     emission = total_weight_kg * weighted_ef / 1000.0
-    return {"배출계수": weighted_ef, "배출량(tCO2e)": emission}
+
+    # 음식물/폐지류/폐목재류의 "소각" 배출분만 생물기원·화석기원으로 분리
+    # (처리비중이 하나도 없어 평균 EF로 계산한 경우에는 소각 비중을 알 수 없으므로 분리하지 않음)
+    bio_group = None
+    incineration_part = None
+    if not (pct_lf is None and pct_inc is None and pct_rec is None):
+        code = sub or mid
+        if code:
+            bio_group = _biogenic_group_from_code(code)
+        elif product and not big:
+            bio_group = _biogenic_group_from_name(product)
+        if bio_group and pct_inc is not None and ef_inc is not None:
+            incineration_part = total_weight_kg * pct_inc * ef_inc / 1000.0
+
+    result = {"배출계수": weighted_ef, "배출량(tCO2e)": emission}
+    result.update(biogenic_fossil_split(emission, incineration_part, bio_group))
+    # 생물기원 CO2는 Scope 3 집계에서 제외 -> 배출량(tCO2e)에는 화석기원분만 남긴다
+    result["배출량(tCO2e)"] = result["화석기원 CO2e(tCO2e)"]
+    return result
 
 
 print("✅ calc_c12_ef_and_emission() 로드 완료 — C12 배출계수를 폐기물_C12 DB 코드 매칭으로 계산합니다.")
